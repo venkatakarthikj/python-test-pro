@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS CloudFormation Template For Continuous Delivery of the APSM layer: This template
+  builds an AWS CodePipeline pipeline that implements a continuous delivery release
+  process for AWS CloudFormation stacks.
+Parameters:
+  PipelineName:
+    Description: A name for pipeline
+    Type: String
+    Default: APSM-Pipeline
+  ArtifactStoreBucket:
+    Description: S3 Bucket Name for stroing code pipeline/ code build artifcats
+    Type: String
+    Default: athena-build-archive
+  RepoName:
+    Description: Repo Name
+    Type: String
+    Default: athena-persistent-state-machines
+  BranchName:
+    Description: Branch Name
+    Type: String
+    Default: release
+  DevStackName:
+    Default: dev-athena-apsm-stack
+    Description: A name for the dev layers stack
+    Type: String
+  ProdStackName:
+    Default: prod-athena-apsm-stack
+    Description: A name for the production layers stack
+    Type: String
+  ChangeSetName:
+    Default: apsm-change-set
+    Description: A name for the production layers stack
+    Type: String
+  TemplateFileName:
+    Description: Transformed SAM Template file name
+    Type: String
+    Default: outputSamTemplate.yaml
+  DevAccount:
+    Description: AWS Account Id of the Dev Account
+    Type: String
+    Default: 053575238526
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "CodePipeline Settings"
+        Parameters:
+          - PipelineName
+          - S3Bucket
+          - SourceS3Key
+          - Email
+      - Label:
+          default: "Test Stack Settings APSM"
+        Parameters:
+          - TestStackName
+          - TemplateFileName
+          - TestStackConfig
+      - Label:
+          default: "Production Stack Settings"
+        Parameters:
+          - ChangeSetName
+          - ProdStackName
+          - ProdStackConfig
+
+Resources:
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !Ref CodeBuildRole
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/ubuntu-base:14.04
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref ArtifactStoreBucket
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 10
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'logs:*'
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - 'ssm:*'
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:GetBucketVersioning
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactStoreBucket}/*"
+                Effect: Allow
+              - Action:
+                - s3:PutObject
+                Resource:
+                - arn:aws:s3:::codepipeline*
+                - !Sub "arn:aws:s3:::${ArtifactStoreBucket}*"
+                Effect: Allow
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactStoreBucket'
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Ref 'PipelineName'
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: TemplateSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: TemplateSource
+              RunOrder: '1'
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: TemplateSource
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: '1'
+        - Name: DevStage
+          Actions:
+            - Name: CreateStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts:
+                - Name: DevStageLayers
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref DevStackName
+                TemplatePath: !Sub "BuildArtifact::${TemplateFileName}"
+                TemplateConfiguration: BuildArtifact::dev.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                OutputFileName: DevStageLayers.json
+              RunOrder: '1'
+            - Name: InvokeLambda
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              InputArtifacts:
+                - Name: DevStageLayers
+              Configuration:
+                FunctionName: !Ref LayerPermissionHandler
+                UserParameters: !Sub "{'StackOutput': 'DevStageLayers.json', 'Name': 'DevStageLayers','LayerSuffix':'Layer','CrossAccounts':['${DevAccount}']}"
+              RunOrder: '2'
+        - Name: ProdStage
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref ProdStackName
+                ChangeSetName: !Ref ChangeSetName
+                TemplatePath: !Sub "BuildArtifact::${TemplateFileName}"
+                TemplateConfiguration: BuildArtifact::prod.json
+                Capabilities: CAPABILITY_IAM
+              RunOrder: '1'
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'A new change set was created for the ${ProdStackName} stack. Do you want to implement the changes?'
+              RunOrder: '2'
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              OutputArtifacts:
+                - Name: ProdStageLayers
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref ProdStackName
+                Capabilities: CAPABILITY_IAM
+                OutputFileName: ProdStageLayers.json
+              RunOrder: '3'
+            - Name: InvokeLambda
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              InputArtifacts:
+                - Name: ProdStageLayers
+              Configuration:
+                FunctionName: !Ref LayerPermissionHandler
+                UserParameters: !Sub "{'StackOutput': 'ProdStageLayers.json', 'Name': 'ProdStageLayers','LayerSuffix':'Layer','CrossAccounts':['${DevAccount}']}"
+              RunOrder: '4'
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:GetBucketVersioning
+                Resource: "*"
+                Effect: Allow
+              - Action:
+                - s3:PutObject
+                Resource:
+                - arn:aws:s3:::codepipeline*
+                - !Sub "arn:aws:s3:::${ArtifactStoreBucket}*"
+                Effect: Allow
+              - Action:
+                - lambda:*
+                Resource:
+                - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*
+                - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:*
+                Effect: Allow
+              - Action:
+                - cloudformation:CreateChangeSet
+                Resource:
+                - !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+                Effect: Allow
+              - Action:
+                - codedeploy:CreateApplication
+                - codedeploy:DeleteApplication
+                - codedeploy:RegisterApplicationRevision
+                Resource:
+                - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:*
+                Effect: Allow
+              - Action:
+                - codedeploy:CreateDeploymentGroup
+                - codedeploy:CreateDeployment
+                - codedeploy:GetDeployment
+                Resource:
+                - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:*
+                Effect: Allow
+              - Action:
+                - codedeploy:GetDeploymentConfig
+                Resource:
+                - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*
+                Effect: Allow
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codepipeline.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'cloudformation:CreateStack'
+                - 'cloudformation:DescribeStacks'
+                - 'cloudformation:DeleteStack'
+                - 'cloudformation:UpdateStack'
+                - 'cloudformation:CreateChangeSet'
+                - 'cloudformation:ExecuteChangeSet'
+                - 'cloudformation:DeleteChangeSet'
+                - 'cloudformation:DescribeChangeSet'
+                - 'cloudformation:SetStackPolicy'
+                - 'iam:PassRole'
+                - 'sns:Publish'
+                - 'codecommit:*'
+                - 'codebuild:*'
+                - 'lambda:*'
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - s3:*
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactStoreBucket}"
+                  - !Sub "arn:aws:s3:::${ArtifactStoreBucket}/*"
+                Effect: Allow
+  LayerPermissionHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [lambda.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - lambda:AddLayerVersionPermission
+                - codepipeline:PutJobFailureResult
+                - codepipeline:PutJobSuccessResult
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: '*'
+  LayerPermissionHandler:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "LayersPermissionHandler.lambda_handler"
+      Role: !GetAtt [LayerPermissionHandlerRole, Arn]
+      Code: layers_permission_enabler/
+      Runtime: python2.7
+      Timeout: 180

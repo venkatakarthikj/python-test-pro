@@ -1,0 +1,32 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This Template Creates the the Athena Persistent State Machine Lambda Layer.
+Parameters:
+  EnvName:
+    Description: Env Name of the Layer
+    Type: String
+    AllowedValues:
+      - Dev
+      - Prod
+    Default: Dev
+  DevAccountId:
+    Description: AWS Account Id of the Dev Account
+    Type: String
+    Default: 053575238526
+Resources:
+  PythonAPSM:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${EnvName}PythonAPSM"
+      Description: The APSM Layer
+      ContentUri: ./staging
+      CompatibleRuntimes:
+        - python2.7
+        - python3.6
+      LicenseInfo: 'Available under the MIT-0 license.'
+      RetentionPolicy: Retain
+Outputs:
+  PythonAPSMLayer:
+    Value:
+      Ref: PythonAPSM

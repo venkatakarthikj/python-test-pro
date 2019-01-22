@@ -1,0 +1,14 @@
+** Quick and dirty deploy **
+
+(From the devops directory)
+1) install the requirements with: 
+
+pip install -r layers_permission_enabler\requirements.txt -t layers_permission_enabler
+
+2) Create the package with:
+
+aws cloudformation package --template-file pipeline.yaml --s3-bucket athena-build-archive --output-template-file packaged-template.yaml --debug
+
+3) Deploy: 
+
+aws cloudformation deploy --templatefile .\packaged-template.yaml --profile athenabitcoin --debug --stack-name Lambda-Layers-Stack

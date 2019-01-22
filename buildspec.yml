@@ -1,0 +1,18 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - python setup.py sdist
+      - mkdir staging
+      - pip install apsm --find-links dist/ -t staging
+      - aws --version
+      - pip install awscli --upgrade --user
+      - aws --version
+      - echo $S3_BUCKET
+      - aws cloudformation package --template-file template.yml --s3-bucket $S3_BUCKET --output-template-file outputSamTemplate.yaml --debug
+artifacts:
+  type: zip
+  files:
+    - outputSamTemplate.yaml
+    - dev.json
+    - prod.json
